@@ -1,0 +1,1220 @@
+---
+title: "ISOM 678 Final Project — Topic 4: Online Retail Analysis"
+author: "Villanelle Chen, Tianyi Huang, Yaxin Qian"
+date: "2026-04-21"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float: true
+    theme: flatly
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+
+library(tidyverse)
+library(lubridate)
+library(scales)
+library(janitor)
+library(skimr)
+library(plotly)
+library(patchwork)
+library(cluster)
+library(factoextra)
+library(keras3)
+library(tidymodels)
+library(nnet)
+```
+
+---
+
+# T1: Exploratory Data Analysis
+
+## Data Loading
+
+```{r t1-load}
+options(timeout = 300)
+retail_raw <- read.csv("https://zhang-datasets.s3.us-east-2.amazonaws.com/Online+Retail.csv")
+```
+
+## Data Cleaning
+
+```{r t1-clean}
+retail <- retail_raw %>%
+  clean_names() %>%
+  mutate(
+    invoice_date  = mdy_hm(invoice_date),
+    is_cancelled  = str_starts(invoice_no, "C"),
+    quantity      = abs(quantity),
+    unit_price    = abs(unit_price),
+    sales         = quantity * unit_price,
+    customer_id   = as.character(customer_id),
+    order_date    = as.Date(invoice_date),
+    order_month   = floor_date(invoice_date, "month")
+  ) %>%
+  distinct()
+
+retail_clean <- retail %>%
+  filter(!is_cancelled, !is.na(customer_id))
+
+purchase <- retail %>%
+  filter(!is_cancelled)
+
+cat("Total rows (cleaned):", nrow(retail_clean), "\n")
+cat("Unique customers:", n_distinct(retail_clean$customer_id), "\n")
+cat("Unique products:", n_distinct(retail_clean$description), "\n")
+cat("Countries:", n_distinct(retail_clean$country), "\n")
+```
+
+## Summary Tables
+
+```{r t1-summary-tables}
+order_summary <- retail_clean %>%
+  group_by(customer_id, invoice_no, order_date, order_month) %>%
+  summarise(
+    order_revenue      = sum(sales, na.rm = TRUE),
+    order_qty          = sum(quantity, na.rm = TRUE),
+    distinct_products  = n_distinct(stock_code),
+    .groups = "drop"
+  )
+
+product_summary <- purchase %>%
+  group_by(stock_code, description) %>%
+  summarise(
+    total_qty       = sum(quantity, na.rm = TRUE),
+    total_revenue   = sum(sales, na.rm = TRUE),
+    order_count     = n_distinct(invoice_no),
+    customer_count  = n_distinct(customer_id),
+    avg_unit_price  = weighted.mean(unit_price, w = quantity, na.rm = TRUE),
+    .groups = "drop"
+  )
+```
+
+## Product-Level Analysis
+
+### Core vs Long-tail Products
+
+```{r t1-core-longtail}
+product_concentration <- product_summary %>%
+  arrange(desc(total_revenue)) %>%
+  mutate(
+    product_rank      = row_number(),
+    revenue_share     = total_revenue / sum(total_revenue),
+    cum_revenue_share = cumsum(revenue_share),
+    product_share     = product_rank / n(),
+    demand_segment    = if_else(cum_revenue_share <= 0.80,
+                                "Core (first 80% revenue)", "Long tail")
+  )
+
+product_concentration %>%
+  summarise(
+    total_products     = n(),
+    core_products      = sum(demand_segment == "Core (first 80% revenue)"),
+    core_product_share = core_products / total_products,
+    core_revenue_share = sum(total_revenue[demand_segment == "Core (first 80% revenue)"]) / sum(total_revenue)
+  )
+
+ggplot(product_concentration, aes(x = product_rank, y = cum_revenue_share)) +
+  geom_line() +
+  geom_hline(yintercept = 0.80, linetype = "dashed") +
+  scale_y_continuous(labels = percent_format()) +
+  labs(title = "Cumulative Revenue Share by Product Rank",
+       x = "Product Rank (sorted by revenue)", y = "Cumulative Revenue Share") +
+  theme_minimal()
+```
+
+### Product Role Matrix
+
+```{r t1-role-matrix}
+freq_cut  <- median(product_summary$order_count, na.rm = TRUE)
+price_cut <- median(product_summary$avg_unit_price, na.rm = TRUE)
+
+product_roles <- product_summary %>%
+  mutate(role = case_when(
+    order_count >= freq_cut & avg_unit_price >= price_cut ~ "High-frequency / High-price",
+    order_count >= freq_cut & avg_unit_price <  price_cut ~ "High-frequency / Low-price",
+    order_count <  freq_cut & avg_unit_price >= price_cut ~ "Low-frequency / High-price",
+    TRUE                                                  ~ "Low-frequency / Low-price"
+  ))
+
+product_roles %>%
+  group_by(role) %>%
+  summarise(
+    n_products    = n(),
+    total_revenue = sum(total_revenue, na.rm = TRUE),
+    avg_orders    = mean(order_count, na.rm = TRUE),
+    avg_price     = mean(avg_unit_price, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+ggplot(product_roles, aes(x = order_count, y = avg_unit_price,
+                           size = total_revenue, color = role)) +
+  geom_point(alpha = 0.7) +
+  geom_vline(xintercept = freq_cut, linetype = "dashed") +
+  geom_hline(yintercept = price_cut, linetype = "dashed") +
+  scale_color_manual(values = c(
+    "High-frequency / High-price" = "#F8766D",
+    "High-frequency / Low-price"  = "#C77CFF",
+    "Low-frequency / High-price"  = "#00BFC4",
+    "Low-frequency / Low-price"   = "black"
+  )) +
+  labs(title = "Product Role Matrix",
+       x = "Order Count", y = "Average Unit Price",
+       size = "Revenue", color = "Role") +
+  theme_minimal()
+```
+
+### Product Penetration and Repeatability
+
+```{r t1-penetration}
+total_customers <- n_distinct(retail_clean$customer_id)
+
+product_customer_orders <- retail_clean %>%
+  group_by(stock_code, description, customer_id) %>%
+  summarise(product_order_count = n_distinct(invoice_no), .groups = "drop")
+
+product_penetration <- product_customer_orders %>%
+  group_by(stock_code, description) %>%
+  summarise(
+    buying_customers      = n(),
+    customer_penetration  = buying_customers / total_customers,
+    repeat_buyers         = sum(product_order_count >= 2),
+    repeat_rate           = repeat_buyers / buying_customers,
+    avg_orders_per_buyer  = mean(product_order_count, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  left_join(product_summary %>% select(stock_code, description, total_revenue, order_count, total_qty),
+            by = c("stock_code", "description"))
+
+ggplot(product_penetration, aes(x = customer_penetration, y = repeat_rate, size = total_revenue)) +
+  geom_point(alpha = 0.7) +
+  scale_x_continuous(labels = percent_format()) +
+  scale_y_continuous(labels = percent_format()) +
+  labs(title = "Product Penetration vs Repeatability",
+       x = "Customer Penetration", y = "Repeat Buyer Rate", size = "Revenue") +
+  theme_minimal()
+```
+
+### Co-purchase / Basket Analysis
+
+```{r t1-basket}
+invoice_product <- purchase %>%
+  select(invoice_no, stock_code, description) %>%
+  distinct()
+
+top_pair_products <- product_summary %>%
+  slice_max(order_count, n = 100) %>%
+  select(stock_code)
+
+invoice_product_top <- invoice_product %>%
+  semi_join(top_pair_products, by = "stock_code")
+
+product_lookup <- invoice_product_top %>%
+  distinct(stock_code, description)
+
+pair_base <- invoice_product_top %>%
+  select(invoice_no, stock_code)
+
+product_pairs <- pair_base %>%
+  inner_join(pair_base, by = "invoice_no", suffix = c("_1", "_2")) %>%
+  filter(stock_code_1 < stock_code_2) %>%
+  count(stock_code_1, stock_code_2, name = "pair_orders", sort = TRUE)
+
+single_counts <- pair_base %>%
+  count(stock_code, name = "product_orders")
+
+n_baskets <- n_distinct(pair_base$invoice_no)
+
+pair_metrics <- product_pairs %>%
+  left_join(single_counts, by = c("stock_code_1" = "stock_code")) %>%
+  rename(product_orders_1 = product_orders) %>%
+  left_join(single_counts, by = c("stock_code_2" = "stock_code")) %>%
+  rename(product_orders_2 = product_orders) %>%
+  mutate(
+    support          = pair_orders / n_baskets,
+    confidence_1to2  = pair_orders / product_orders_1,
+    confidence_2to1  = pair_orders / product_orders_2,
+    lift             = support / ((product_orders_1 / n_baskets) * (product_orders_2 / n_baskets))
+  ) %>%
+  left_join(product_lookup, by = c("stock_code_1" = "stock_code")) %>%
+  rename(description_1 = description) %>%
+  left_join(product_lookup, by = c("stock_code_2" = "stock_code")) %>%
+  rename(description_2 = description)
+
+top_pairs_by_lift <- pair_metrics %>%
+  filter(pair_orders >= 20) %>%
+  arrange(desc(lift)) %>%
+  slice_head(n = 20)
+
+ggplot(top_pairs_by_lift,
+       aes(x = reorder(paste(description_1, "&", description_2), lift), y = lift)) +
+  geom_col() +
+  coord_flip() +
+  labs(title = "Top Product Pairs by Lift", x = "Product Pair", y = "Lift") +
+  theme_minimal()
+```
+
+### Product Return Risk
+
+```{r t1-returns}
+product_purchase_stats <- purchase %>%
+  group_by(stock_code, description) %>%
+  summarise(
+    purchase_qty     = sum(quantity, na.rm = TRUE),
+    purchase_orders  = n_distinct(invoice_no),
+    purchase_revenue = sum(sales, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+product_return_stats <- retail %>%
+  filter(is_cancelled | quantity < 0) %>%
+  group_by(stock_code, description) %>%
+  summarise(
+    return_qty    = abs(sum(quantity, na.rm = TRUE)),
+    return_orders = n_distinct(invoice_no),
+    return_value  = abs(sum(sales, na.rm = TRUE)),
+    .groups = "drop"
+  )
+
+product_return_profile <- product_purchase_stats %>%
+  left_join(product_return_stats, by = c("stock_code", "description")) %>%
+  mutate(
+    return_qty    = replace_na(return_qty, 0),
+    return_orders = replace_na(return_orders, 0),
+    return_value  = replace_na(return_value, 0),
+    return_qty_rate    = return_qty / purchase_qty,
+    return_order_ratio = return_orders / purchase_orders
+  )
+
+ggplot(product_return_profile, aes(x = purchase_qty, y = return_qty_rate)) +
+  geom_point(alpha = 0.5) +
+  scale_y_continuous(labels = percent_format()) +
+  labs(title = "Product Return Risk",
+       x = "Purchased Quantity", y = "Return Quantity Rate") +
+  theme_minimal()
+```
+
+## Customer-Level Analysis
+
+### RFM Analysis
+
+```{r t1-rfm}
+snapshot_date_t1 <- max(retail_clean$invoice_date) + days(1)
+
+rfm_t1 <- retail_clean %>%
+  group_by(customer_id) %>%
+  summarise(
+    recency   = as.numeric(snapshot_date_t1 - max(invoice_date)),
+    frequency = n_distinct(invoice_no),
+    monetary  = sum(sales, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+plot_ly(
+  data = rfm_t1 %>% mutate(customer_id = as.character(customer_id)),
+  x = ~recency, y = ~frequency, z = ~monetary,
+  type = "scatter3d", mode = "markers",
+  marker = list(size = 4, opacity = 0.6),
+  text = ~paste("Customer ID:", customer_id,
+                "<br>Recency:", recency,
+                "<br>Frequency:", frequency,
+                "<br>Monetary:", round(monetary, 2)),
+  hoverinfo = "text"
+) %>%
+  layout(title = "3D RFM Scatter Plot",
+         scene = list(xaxis = list(title = "Recency"),
+                      yaxis = list(title = "Frequency"),
+                      zaxis = list(title = "Monetary")))
+```
+
+### One-time vs Repeat Customers
+
+```{r t1-repeat}
+customer_repeat <- order_summary %>%
+  group_by(customer_id) %>%
+  summarise(
+    n_orders        = n_distinct(invoice_no),
+    total_spent     = sum(order_revenue, na.rm = TRUE),
+    avg_order_value = mean(order_revenue, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(customer_type = if_else(n_orders == 1, "One-time", "Repeat"))
+
+customer_repeat %>%
+  group_by(customer_type) %>%
+  summarise(
+    n_customers   = n(),
+    pct_customers = n() / nrow(customer_repeat),
+    total_revenue = sum(total_spent, na.rm = TRUE),
+    pct_revenue   = total_revenue / sum(customer_repeat$total_spent, na.rm = TRUE),
+    avg_orders    = mean(n_orders, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  pivot_longer(cols = c(pct_customers, pct_revenue),
+               names_to = "metric", values_to = "value") %>%
+  mutate(metric = recode(metric,
+                         pct_customers = "Customer Share",
+                         pct_revenue   = "Revenue Share")) %>%
+  ggplot(aes(x = customer_type, y = value, fill = metric)) +
+  geom_col(position = "dodge") +
+  scale_y_continuous(labels = percent_format()) +
+  labs(title = "One-time vs Repeat Customers",
+       x = "Customer Type", y = "Share") +
+  theme_minimal()
+```
+
+### Cohort Retention
+
+```{r t1-cohort}
+customer_first_purchase <- order_summary %>%
+  group_by(customer_id) %>%
+  summarise(cohort_month = floor_date(min(order_date), "month"), .groups = "drop")
+
+cohort_data <- order_summary %>%
+  select(customer_id, order_month) %>%
+  distinct() %>%
+  left_join(customer_first_purchase, by = "customer_id") %>%
+  mutate(cohort_index = 12 * (year(order_month) - year(cohort_month)) +
+           (month(order_month) - month(cohort_month)))
+
+cohort_retention <- cohort_data %>%
+  group_by(cohort_month, cohort_index) %>%
+  summarise(n_customers = n_distinct(customer_id), .groups = "drop") %>%
+  left_join(
+    cohort_data %>%
+      group_by(cohort_month, cohort_index) %>%
+      summarise(n_customers = n_distinct(customer_id), .groups = "drop") %>%
+      filter(cohort_index == 0) %>%
+      select(cohort_month, cohort_size = n_customers),
+    by = "cohort_month"
+  ) %>%
+  mutate(retention_rate = n_customers / cohort_size)
+
+ggplot(cohort_retention, aes(x = cohort_index, y = factor(cohort_month), fill = retention_rate)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = percent(retention_rate, accuracy = 1)), size = 3) +
+  scale_fill_gradient(low = "white", high = "steelblue", labels = percent_format()) +
+  labs(title = "Customer Cohort Retention",
+       x = "Months Since First Purchase", y = "Cohort Month", fill = "Retention Rate") +
+  theme_minimal()
+```
+
+### Interpurchase Behavior
+
+```{r t1-gap}
+purchase_gap <- order_summary %>%
+  distinct(customer_id, order_date) %>%
+  arrange(customer_id, order_date) %>%
+  group_by(customer_id) %>%
+  mutate(gap_days = as.numeric(order_date - lag(order_date))) %>%
+  filter(!is.na(gap_days)) %>%
+  ungroup()
+
+customer_gap_summary <- purchase_gap %>%
+  group_by(customer_id) %>%
+  summarise(
+    avg_gap_days       = mean(gap_days, na.rm = TRUE),
+    median_gap_days    = median(gap_days, na.rm = TRUE),
+    min_gap_days       = min(gap_days, na.rm = TRUE),
+    max_gap_days       = max(gap_days, na.rm = TRUE),
+    n_repeat_intervals = n(),
+    .groups = "drop"
+  )
+
+ggplot(customer_gap_summary, aes(x = avg_gap_days)) +
+  geom_histogram(bins = 40) +
+  labs(title = "Distribution of Average Days Between Purchases",
+       x = "Average Gap Between Purchases (Days)", y = "Number of Customers") +
+  theme_minimal()
+```
+
+## Time-Series Analysis
+
+### Monthly Revenue Trend
+
+```{r t1-monthly}
+monthly_sales <- purchase %>%
+  mutate(year_month = floor_date(invoice_date, "month")) %>%
+  group_by(year_month) %>%
+  summarise(
+    revenue   = sum(sales, na.rm = TRUE),
+    orders    = n_distinct(invoice_no),
+    customers = n_distinct(customer_id),
+    .groups = "drop"
+  )
+
+ggplot(monthly_sales, aes(x = year_month, y = revenue)) +
+  geom_line() + geom_point() +
+  scale_y_continuous(labels = dollar_format()) +
+  labs(title = "Monthly Revenue Trend", x = "Month", y = "Revenue") +
+  theme_minimal()
+```
+
+### Weekly and Daily Activity Patterns
+
+```{r t1-weekly}
+daily_summary <- purchase %>%
+  mutate(
+    date    = as.Date(invoice_date),
+    weekday = wday(invoice_date, label = TRUE, abbr = FALSE, week_start = 1)
+  ) %>%
+  group_by(date, weekday) %>%
+  summarise(
+    daily_revenue   = sum(sales, na.rm = TRUE),
+    daily_orders    = n_distinct(invoice_no),
+    daily_customers = n_distinct(customer_id),
+    .groups = "drop"
+  ) %>%
+  mutate(weekday = factor(weekday,
+                          levels = c("Monday","Tuesday","Wednesday",
+                                     "Thursday","Friday","Saturday","Sunday")))
+
+daily_summary %>%
+  pivot_longer(cols = c(daily_revenue, daily_orders, daily_customers),
+               names_to = "metric", values_to = "value") %>%
+  mutate(metric = recode(metric,
+                         daily_revenue   = "Daily Revenue",
+                         daily_orders    = "Daily Orders",
+                         daily_customers = "Daily Active Customers")) %>%
+  ggplot(aes(x = weekday, y = value)) +
+  geom_boxplot() +
+  facet_wrap(~metric, scales = "free_y", ncol = 3) +
+  labs(title = "Activity Distribution by Weekday", x = "Weekday", y = NULL) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        strip.text = element_text(face = "bold"))
+```
+
+## Country-Level Analysis
+
+```{r t1-country}
+country_summary <- purchase %>%
+  group_by(country) %>%
+  summarise(
+    revenue   = sum(sales, na.rm = TRUE),
+    orders    = n_distinct(invoice_no),
+    customers = n_distinct(customer_id),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(revenue))
+
+country_summary %>%
+  slice_max(order_by = revenue, n = 10) %>%
+  ggplot(aes(x = reorder(country, revenue), y = revenue)) +
+  geom_col() + coord_flip() +
+  scale_y_continuous(labels = dollar_format()) +
+  labs(title = "Top 10 Countries by Revenue", x = "Country", y = "Revenue") +
+  theme_minimal()
+
+purchase %>%
+  mutate(region_group = if_else(country == "United Kingdom", "UK", "Non-UK")) %>%
+  group_by(region_group) %>%
+  summarise(
+    revenue         = sum(sales, na.rm = TRUE),
+    orders          = n_distinct(invoice_no),
+    customers       = n_distinct(customer_id),
+    avg_order_value = revenue / orders,
+    .groups = "drop"
+  ) %>%
+  ggplot(aes(x = region_group, y = revenue, fill = region_group)) +
+  geom_col() +
+  labs(title = "Revenue by Region", x = "Region", y = "Revenue") +
+  theme_minimal() +
+  theme(legend.position = "none")
+```
+---
+
+# T2: Customer Segmentation
+
+## Data Loading & Cleaning
+
+```{r t2-load}
+retail_t2 <- read.csv(
+  "https://zhang-datasets.s3.us-east-2.amazonaws.com/Online+Retail.csv",
+  stringsAsFactors = FALSE
+)
+
+retail_t2 <- retail_t2 %>%
+  mutate(
+    InvoiceDate  = mdy_hm(InvoiceDate),
+    is_cancelled = str_starts(InvoiceNo, "C"),
+    Sales        = Quantity * UnitPrice,
+    CustomerID   = as.character(CustomerID)
+  ) %>%
+  distinct()
+
+retail_clean_t2 <- retail_t2 %>%
+  filter(
+    !is_cancelled,
+    Quantity  > 0,
+    UnitPrice > 0,
+    !is.na(CustomerID)
+  )
+
+cat("Clean data rows:", nrow(retail_clean_t2), "\n")
+cat("Unique customers:", n_distinct(retail_clean_t2$CustomerID), "\n")
+```
+
+## Feature Engineering
+
+### Base RFM
+
+```{r t2-rfm}
+snapshot_date <- as.Date(max(retail_clean_t2$InvoiceDate)) + days(1)
+
+rfm <- retail_clean_t2 %>%
+  group_by(CustomerID) %>%
+  summarise(
+    Recency   = as.numeric(snapshot_date - as.Date(max(InvoiceDate))),
+    Frequency = n_distinct(InvoiceNo),
+    Monetary  = sum(Sales, na.rm = TRUE),
+    .groups   = "drop"
+  )
+```
+
+### Additional Features
+
+```{r t2-features}
+# avg_gap_days: average days between purchases (one-time buyers filled with Recency)
+avg_gap_days_df <- retail_clean_t2 %>%
+  distinct(CustomerID, InvoiceDate) %>%
+  mutate(InvoiceDate = as.Date(InvoiceDate)) %>%
+  arrange(CustomerID, InvoiceDate) %>%
+  group_by(CustomerID) %>%
+  mutate(gap = as.numeric(difftime(InvoiceDate, lag(InvoiceDate), units = "days"))) %>%
+  summarise(avg_gap_days = mean(gap, na.rm = TRUE), .groups = "drop")
+
+rfm <- rfm %>%
+  select(-any_of("avg_gap_days")) %>%
+  left_join(avg_gap_days_df, by = "CustomerID") %>%
+  mutate(avg_gap_days = if_else(is.nan(avg_gap_days) | is.na(avg_gap_days),
+                                Recency, avg_gap_days))
+
+# is_repeat: 1 if customer made more than one order
+rfm <- rfm %>%
+  mutate(is_repeat = if_else(Frequency > 1, 1L, 0L))
+
+# return_rate: returned quantity / purchased quantity
+purchased_qty <- retail_clean_t2 %>%
+  group_by(CustomerID) %>%
+  summarise(purchase_qty = sum(Quantity, na.rm = TRUE), .groups = "drop")
+
+returned_qty <- retail_t2 %>%
+  filter(is_cancelled | Quantity < 0, !is.na(CustomerID)) %>%
+  group_by(CustomerID) %>%
+  summarise(return_qty = sum(abs(Quantity), na.rm = TRUE), .groups = "drop")
+
+return_df <- purchased_qty %>%
+  left_join(returned_qty, by = "CustomerID") %>%
+  mutate(return_qty  = replace_na(return_qty, 0),
+         return_rate = return_qty / purchase_qty)
+
+rfm <- rfm %>%
+  left_join(return_df %>% select(CustomerID, return_rate), by = "CustomerID") %>%
+  mutate(return_rate = replace_na(return_rate, 0))
+
+# is_UK: 1 if customer's most frequent country is United Kingdom
+customer_country <- retail_clean_t2 %>%
+  group_by(CustomerID) %>%
+  summarise(Country = names(which.max(table(Country))), .groups = "drop")
+
+rfm <- rfm %>%
+  left_join(customer_country, by = "CustomerID") %>%
+  mutate(is_UK = if_else(Country == "United Kingdom", 1L, 0L)) %>%
+  select(-Country)
+```
+
+### Feature Scaling
+
+```{r t2-scaling}
+kmeans_features <- c("Recency", "Frequency", "Monetary", "avg_gap_days", "is_repeat")
+ae_features     <- c("Recency", "Frequency", "Monetary", "avg_gap_days",
+                     "is_repeat", "return_rate", "is_UK")
+
+X_kmeans <- scale(rfm[, kmeans_features])
+X_ae     <- scale(rfm[, ae_features])
+```
+
+## K-Means Clustering
+
+### Choosing K
+
+```{r t2-choose-k, fig.width=12, fig.height=4}
+set.seed(42)
+
+p_elbow <- fviz_nbclust(X_kmeans, kmeans, method = "wss", k.max = 10) +
+  labs(title = "Elbow Method")
+
+p_sil <- fviz_nbclust(X_kmeans, kmeans, method = "silhouette", k.max = 10) +
+  labs(title = "Silhouette Score")
+
+p_elbow + p_sil
+```
+
+### Preprocessing Comparison
+
+```{r t2-preprocessing}
+# PAM with Manhattan distance
+pam_result <- pam(X_kmeans, k = 4, metric = "manhattan")
+pam_sil <- mean(silhouette(pam_result$clustering,
+                            dist(X_kmeans, method = "manhattan"))[, 3])
+
+# Outlier removal
+rfm_trim <- rfm %>% filter(Monetary < quantile(Monetary, 0.99))
+X_trim   <- scale(rfm_trim[, kmeans_features])
+km_trim  <- kmeans(X_trim, centers = 4, nstart = 25)
+trim_sil <- mean(silhouette(km_trim$cluster, dist(X_trim))[, 3])
+
+# Log transformation
+rfm_log <- rfm %>%
+  mutate(Monetary     = log1p(Monetary),
+         Frequency    = log1p(Frequency),
+         avg_gap_days = log1p(avg_gap_days))
+X_log   <- scale(rfm_log[, kmeans_features])
+km_log  <- kmeans(X_log, centers = 4, nstart = 25)
+log_sil <- mean(silhouette(km_log$cluster, dist(X_log))[, 3])
+
+# Log + outlier removal
+rfm_comb <- rfm %>%
+  filter(Monetary < quantile(Monetary, 0.99)) %>%
+  mutate(Monetary     = log1p(Monetary),
+         Frequency    = log1p(Frequency),
+         avg_gap_days = log1p(avg_gap_days))
+X_comb   <- scale(rfm_comb[, kmeans_features])
+km_comb  <- kmeans(X_comb, centers = 4, nstart = 25)
+comb_sil <- mean(silhouette(km_comb$cluster, dist(X_comb))[, 3])
+
+tibble(
+  Method            = c("Original (StandardScaler)", "PAM (Manhattan)",
+                        "Outlier Removal", "Log Transform", "Log + Outlier Removal"),
+  Silhouette_Score  = round(c(NA, pam_sil, trim_sil, log_sil, comb_sil), 4)
+)
+```
+
+### Final K-Means Model (K = 4)
+
+```{r t2-kmeans-fit}
+K_FINAL_KM <- 4
+
+km_final <- kmeans(X_kmeans, centers = K_FINAL_KM, nstart = 25, iter.max = 100)
+rfm$KMeans_Cluster <- as.factor(km_final$cluster)
+
+km_sil_obj <- silhouette(km_final$cluster, dist(X_kmeans))
+km_sil     <- mean(km_sil_obj[, 3])
+cat(sprintf("K-Means Silhouette Score (K=%d): %.4f\n", K_FINAL_KM, km_sil))
+```
+
+### Cluster Profiles and Labels
+
+```{r t2-kmeans-profile}
+km_profile <- rfm %>%
+  group_by(KMeans_Cluster) %>%
+  summarise(across(all_of(kmeans_features), mean), .groups = "drop")
+
+km_profile
+```
+
+```{r t2-kmeans-label}
+cluster_labels_km <- c(
+  "1" = "Champions",
+  "2" = "Potential Loyalists",
+  "3" = "Lost",
+  "4" = "New / One-time"
+)
+
+rfm$KMeans_Label <- cluster_labels_km[as.character(rfm$KMeans_Cluster)]
+
+cat("K-Means cluster sizes:\n")
+print(table(rfm$KMeans_Label))
+```
+
+## Autoencoder Clustering
+
+### Build and Train Autoencoder
+
+```{r t2-ae-build}
+INPUT_DIM  <- ncol(X_ae)
+LATENT_DIM <- 2
+
+input_layer <- keras_input(shape = INPUT_DIM)
+
+encoded <- input_layer %>%
+  layer_dense(units = 16, activation = "relu") %>%
+  layer_dense(units = 8,  activation = "relu") %>%
+  layer_dense(units = LATENT_DIM)
+
+decoded <- encoded %>%
+  layer_dense(units = 8,  activation = "relu") %>%
+  layer_dense(units = 16, activation = "relu") %>%
+  layer_dense(units = INPUT_DIM)
+
+autoencoder <- keras_model(inputs = input_layer, outputs = decoded)
+encoder     <- keras_model(inputs = input_layer, outputs = encoded)
+
+autoencoder$compile(
+  optimizer = optimizer_adam(learning_rate = 0.001),
+  loss      = "mse"
+)
+```
+
+```{r t2-ae-train}
+X_ae_matrix <- as.matrix(X_ae)
+
+history <- autoencoder$fit(
+  x          = X_ae_matrix,
+  y          = X_ae_matrix,
+  epochs     = as.integer(50),
+  batch_size = as.integer(64),
+  shuffle    = TRUE,
+  verbose    = 0
+)
+plot(history$history$loss, type = "l",
+     main = "Autoencoder Training Loss", xlab = "Epoch", ylab = "MSE Loss")
+```
+
+### Extract Latent Space and Cluster
+
+```{r t2-ae-cluster}
+Z <- encoder$predict(X_ae_matrix)
+colnames(Z) <- c("Z1", "Z2")
+rfm$AE_Z1 <- Z[, 1]
+rfm$AE_Z2 <- Z[, 2]
+
+# Find optimal K in latent space
+fviz_nbclust(Z, kmeans, method = "silhouette", k.max = 10) +
+  labs(title = "Silhouette Score — Autoencoder Latent Space")
+```
+
+```{r t2-ae-fit}
+K_FINAL_AE <- 3
+set.seed(42)
+
+km_ae          <- kmeans(Z, centers = K_FINAL_AE, nstart = 25, iter.max = 100)
+rfm$AE_Cluster <- as.factor(km_ae$cluster)
+
+ae_sil      <- mean(silhouette(km_ae$cluster, dist(Z))[, 3])
+ae_sil_fair <- mean(silhouette(as.integer(rfm$AE_Cluster), dist(X_kmeans))[, 3])
+
+cat(sprintf("Autoencoder Silhouette (latent space):    %.4f\n", ae_sil))
+cat(sprintf("Autoencoder Silhouette (original space):  %.4f\n", ae_sil_fair))
+```
+
+### Autoencoder Cluster Profiles and Labels
+
+```{r t2-ae-profile}
+ae_profile <- rfm %>%
+  group_by(AE_Cluster) %>%
+  summarise(across(all_of(kmeans_features), mean), .groups = "drop")
+
+ae_profile
+```
+
+```{r t2-ae-label}
+cluster_labels_ae <- c(
+  "1" = "Lost",
+  "2" = "Lapsing Loyalists",
+  "3" = "Potential Loyalists"
+)
+
+rfm$AE_Label <- cluster_labels_ae[as.character(rfm$AE_Cluster)]
+
+cat("Autoencoder cluster sizes:\n")
+print(table(rfm$AE_Label))
+```
+
+## Performance Comparison
+
+```{r t2-comparison}
+tibble(
+  Method            = c("K-Means (original space)",
+                        "Autoencoder (latent space)",
+                        "Autoencoder (original space — fair comparison)"),
+  Silhouette_Score  = round(c(km_sil, ae_sil, ae_sil_fair), 4),
+  Note              = c("Primary method",
+                        "Not directly comparable to K-Means",
+                        "Fair comparison — same feature space")
+)
+```
+
+```{r t2-variance}
+cat("Intra-cluster Std Dev — K-Means:\n")
+rfm %>%
+  group_by(KMeans_Cluster) %>%
+  summarise(across(all_of(kmeans_features), sd), .groups = "drop") %>%
+  print()
+
+cat("\nIntra-cluster Std Dev — Autoencoder:\n")
+rfm %>%
+  group_by(AE_Cluster) %>%
+  summarise(across(all_of(kmeans_features), sd), .groups = "drop") %>%
+  print()
+```
+
+```{r t2-viz, fig.width=12, fig.height=5}
+pca_result <- prcomp(X_kmeans, center = FALSE, scale. = FALSE)
+pca_coords <- as.data.frame(pca_result$x[, 1:2])
+colnames(pca_coords) <- c("PC1", "PC2")
+pca_coords$KMeans_Label <- rfm$KMeans_Label
+pca_coords$AE_Label     <- rfm$AE_Label
+
+p1 <- ggplot(pca_coords, aes(x = PC1, y = PC2, color = KMeans_Label)) +
+  geom_point(alpha = 0.5, size = 1) +
+  labs(title = "K-Means Clusters (PCA View)", color = "Segment") +
+  theme_minimal()
+
+p2 <- ggplot(data.frame(Z1 = Z[,1], Z2 = Z[,2], AE_Label = rfm$AE_Label),
+             aes(x = Z1, y = Z2, color = AE_Label)) +
+  geom_point(alpha = 0.5, size = 1) +
+  labs(title = "Autoencoder Clusters (Latent Space)", color = "Segment") +
+  theme_minimal()
+
+p1 + p2
+```
+
+
+---
+
+# T3: Customer Churn Prediction (Optional)
+
+## Data Loading & Cleaning
+
+```{r t3-load}
+retail_t3 <- read.csv(
+  "https://zhang-datasets.s3.us-east-2.amazonaws.com/Online+Retail.csv"
+) %>%
+  clean_names() %>%
+  mutate(
+    invoice_no   = as.character(invoice_no),
+    stock_code   = as.character(stock_code),
+    description  = as.character(description),
+    customer_id  = as.character(customer_id),
+    invoice_date = mdy_hm(invoice_date),
+    is_cancelled = str_starts(invoice_no, "C"),
+    sales        = quantity * unit_price
+  ) %>%
+  distinct()
+
+retail_clean_t3 <- retail_t3 %>%
+  filter(
+    !is_cancelled,
+    quantity   > 0,
+    unit_price > 0,
+    !is.na(customer_id)
+  ) %>%
+  mutate(
+    customer_id = as.character(customer_id),
+    order_date  = as.Date(invoice_date),
+    order_month = floor_date(invoice_date, "month")
+  )
+```
+
+## Data Preparation
+
+```{r t3-setup}
+set.seed(123)
+
+end_date         <- max(retail_clean_t3$order_date, na.rm = TRUE)
+start_date       <- min(retail_clean_t3$order_date, na.rm = TRUE)
+feature_end_date <- start_date %m+% months(9)
+label_start_date <- end_date   %m-% months(3)
+
+cat("Start date:",          as.character(start_date),        "\n")
+cat("Feature window ends:", as.character(feature_end_date),  "\n")
+cat("Label window starts:", as.character(label_start_date),  "\n")
+cat("End date:",            as.character(end_date),          "\n")
+
+feature_transactions <- retail_clean_t3 %>%
+  filter(order_date >= start_date & order_date < feature_end_date)
+
+label_transactions <- retail_clean_t3 %>%
+  filter(order_date >= label_start_date & order_date <= end_date)
+```
+
+## Feature Construction (First 9 Months)
+
+```{r t3-features}
+# Order-level summary
+order_summary_9m <- feature_transactions %>%
+  group_by(customer_id, invoice_no, order_date, order_month) %>%
+  summarise(
+    order_revenue     = sum(sales, na.rm = TRUE),
+    order_qty         = sum(quantity, na.rm = TRUE),
+    distinct_products = n_distinct(stock_code),
+    .groups = "drop"
+  )
+
+# RFM (POSIXct snapshot, matches original T3)
+snapshot_date_t3 <- max(feature_transactions$invoice_date, na.rm = TRUE) + days(1)
+
+rfm_9m <- feature_transactions %>%
+  group_by(customer_id) %>%
+  summarise(
+    recency   = as.numeric(snapshot_date_t3 - max(invoice_date)),
+    frequency = n_distinct(invoice_no),
+    monetary  = sum(sales, na.rm = TRUE),
+    .groups   = "drop"
+  )
+
+# One-time vs repeat features
+customer_repeat_9m <- order_summary_9m %>%
+  group_by(customer_id) %>%
+  summarise(
+    n_orders              = n_distinct(invoice_no),
+    total_spent           = sum(order_revenue, na.rm = TRUE),
+    avg_order_value       = mean(order_revenue, na.rm = TRUE),
+    avg_order_qty         = mean(order_qty, na.rm = TRUE),
+    avg_distinct_products = mean(distinct_products, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    customer_type = if_else(n_orders == 1, "One-time", "Repeat")
+  )
+
+# Interpurchase-gap features (3-step pipeline, matches original T3)
+customer_purchase_dates_9m <- order_summary_9m %>%
+  distinct(customer_id, order_date) %>%
+  arrange(customer_id, order_date)
+
+purchase_gap_9m <- customer_purchase_dates_9m %>%
+  group_by(customer_id) %>%
+  mutate(
+    gap_days = as.numeric(order_date - lag(order_date))
+  ) %>%
+  filter(!is.na(gap_days)) %>%
+  ungroup()
+
+customer_gap_summary_9m <- purchase_gap_9m %>%
+  group_by(customer_id) %>%
+  summarise(
+    avg_gap_days       = mean(gap_days, na.rm = TRUE),
+    median_gap_days    = median(gap_days, na.rm = TRUE),
+    min_gap_days       = min(gap_days, na.rm = TRUE),
+    max_gap_days       = max(gap_days, na.rm = TRUE),
+    n_repeat_intervals = n(),
+    .groups = "drop"
+  )
+
+# Additional activity features
+customer_activity_9m <- feature_transactions %>%
+  group_by(customer_id) %>%
+  summarise(
+    total_lines            = n(),
+    unique_products        = n_distinct(stock_code),
+    active_days            = n_distinct(order_date),
+    active_months          = n_distinct(order_month),
+    avg_unit_price         = mean(unit_price, na.rm = TRUE),
+    avg_quantity           = mean(quantity, na.rm = TRUE),
+    customer_lifetime_days = as.numeric(max(order_date) - min(order_date)),
+    country                = first(country),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    is_uk = if_else(country == "United Kingdom", 1, 0)
+  ) %>%
+  select(-country)
+```
+
+## Churn Label Construction
+
+```{r t3-label}
+customers_in_first_9m <- feature_transactions %>%
+  distinct(customer_id)
+
+customers_active_in_last_3m <- label_transactions %>%
+  distinct(customer_id) %>%
+  mutate(active_last_3m = 1)
+
+churn_label <- customers_in_first_9m %>%
+  left_join(customers_active_in_last_3m, by = "customer_id") %>%
+  mutate(
+    active_last_3m = replace_na(active_last_3m, 0),
+    churn          = if_else(active_last_3m == 1, 0, 1)
+  ) %>%
+  select(customer_id, churn)
+
+churn_data <- churn_label %>%
+  left_join(rfm_9m,                  by = "customer_id") %>%
+  left_join(customer_repeat_9m,      by = "customer_id") %>%
+  left_join(customer_gap_summary_9m, by = "customer_id") %>%
+  left_join(customer_activity_9m,    by = "customer_id") %>%
+  mutate(
+    customer_type = factor(customer_type),
+    churn         = factor(churn, levels = c(0, 1), labels = c("No", "Yes"))
+  )
+
+cat("Final churn dataset dimensions:\n")
+print(dim(churn_data))
+
+cat("\nChurn distribution:\n")
+print(table(churn_data$churn))
+print(prop.table(table(churn_data$churn)))
+
+head(churn_data)
+```
+
+## Model Training
+
+```{r t3-split}
+split_obj  <- initial_split(churn_data, prop = 0.8, strata = churn)
+train_data <- training(split_obj)
+test_data  <- testing(split_obj)
+```
+
+```{r t3-recipe}
+churn_recipe <- recipe(churn ~ ., data = train_data) %>%
+  update_role(customer_id, new_role = "id") %>%
+  step_impute_median(
+    avg_gap_days,
+    median_gap_days,
+    min_gap_days,
+    max_gap_days,
+    n_repeat_intervals
+  ) %>%
+  step_log(
+    monetary,
+    total_spent,
+    avg_order_value,
+    frequency,
+    n_orders,
+    total_lines,
+    unique_products,
+    offset = 1
+  ) %>%
+  step_dummy(all_nominal_predictors()) %>%
+  step_normalize(all_numeric_predictors()) %>%
+  step_zv(all_predictors())
+```
+
+### Logistic Regression
+
+```{r t3-logistic}
+log_model <- logistic_reg() %>%
+  set_engine("glm") %>%
+  set_mode("classification")
+
+log_workflow <- workflow() %>%
+  add_recipe(churn_recipe) %>%
+  add_model(log_model)
+
+log_fit <- fit(log_workflow, data = train_data)
+
+log_predictions <- test_data %>%
+  bind_cols(
+    predict(log_fit, new_data = test_data, type = "prob"),
+    predict(log_fit, new_data = test_data, type = "class")
+  )
+
+head(log_predictions)
+```
+
+### Neural Network
+
+```{r t3-nn}
+nn_model <- mlp(
+  hidden_units = 8,
+  penalty      = 0.01,
+  epochs       = 200
+) %>%
+  set_engine("nnet", trace = FALSE) %>%
+  set_mode("classification")
+
+nn_workflow <- workflow() %>%
+  add_recipe(churn_recipe) %>%
+  add_model(nn_model)
+
+nn_fit <- fit(nn_workflow, data = train_data)
+
+nn_predictions <- test_data %>%
+  bind_cols(
+    predict(nn_fit, new_data = test_data, type = "prob"),
+    predict(nn_fit, new_data = test_data, type = "class")
+  )
+
+head(nn_predictions)
+```
+
+## Model Evaluation
+
+```{r t3-evaluate}
+get_model_metrics <- function(predictions, model_name) {
+
+  auc_result <- roc_auc(
+    predictions,
+    truth = churn,
+    .pred_Yes,
+    event_level = "second"
+  )
+
+  accuracy_result <- accuracy(
+    predictions,
+    truth = churn,
+    estimate = .pred_class
+  )
+
+  precision_result <- precision(
+    predictions,
+    truth = churn,
+    estimate = .pred_class,
+    event_level = "second"
+  )
+
+  recall_result <- recall(
+    predictions,
+    truth = churn,
+    estimate = .pred_class,
+    event_level = "second"
+  )
+
+  f1_result <- f_meas(
+    predictions,
+    truth = churn,
+    estimate = .pred_class,
+    event_level = "second"
+  )
+
+  bind_rows(
+    auc_result,
+    accuracy_result,
+    precision_result,
+    recall_result,
+    f1_result
+  ) %>%
+    select(.metric, .estimate) %>%
+    mutate(model = model_name) %>%
+    select(model, everything())
+}
+
+log_results <- get_model_metrics(log_predictions, "Logistic Regression")
+nn_results  <- get_model_metrics(nn_predictions,  "Neural Network")
+
+model_results <- bind_rows(log_results, nn_results)
+
+model_results
+```
+
+```{r t3-confusion}
+cat("Logistic Regression Confusion Matrix:\n")
+print(conf_mat(log_predictions, truth = churn, estimate = .pred_class))
+
+cat("\nNeural Network Confusion Matrix:\n")
+print(conf_mat(nn_predictions, truth = churn, estimate = .pred_class))
+```
+
+```{r t3-coef}
+log_coefficients <- tidy(extract_fit_parsnip(log_fit)$fit) %>%
+  arrange(desc(abs(estimate)))
+
+head(log_coefficients, 15)
+```
+
+```{r t3-prob-plot}
+ggplot(log_predictions, aes(x = .pred_Yes, fill = churn)) +
+  geom_histogram(bins = 30, alpha = 0.6, position = "identity") +
+  labs(
+    title = "Predicted Churn Probability Distribution",
+    x = "Predicted Probability of Churn",
+    y = "Count"
+  ) +
+  theme_minimal()
+```
